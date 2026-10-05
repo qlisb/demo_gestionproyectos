@@ -61,3 +61,14 @@
 #*.PDF   diff=astextplain
 #*.rtf   diff=astextplain
 #*.RTF   diff=astextplain
+
+# Normalize common text files
+*.js text
+*.jsx text
+*.json text
+*.css text
+*.md text
+*.html text
+
+# SVGs as text
+*.svg text
