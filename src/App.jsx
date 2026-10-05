@@ -7,6 +7,7 @@ import "./App.css";
 import Header from "./components/Layout/Header";
 import Sidebar from "./components/Layout/Sidebar";
 import MapView from "./components/Map/MapView";
+import StackedBarChart from "./components/Charts/StackedBarChart";
 
 function App() {
     const [layers, setLayers] = useState({
@@ -14,11 +15,15 @@ function App() {
         pointsOpacity: 0.5,
     });
 
+    const [chartEstadoData, setChartEstadoData] = useState([]);
+    const [chartTipoData, setChartTipoData] = useState([]);
+
     const FEATURE_SERVICE =
         "https://services6.arcgis.com/VhaZpxaKWh8z652A/arcgis/rest/services/FS_Demo3D/FeatureServer";
 
     const [selectedLayers, setSelectedLayers] = useState(new Set());
     const [serviceLayers, setServiceLayers] = useState(null);
+    const [serviceTables, setServiceTables] = useState(null);
     const [serviceError, setServiceError] = useState(null);
     const [lastClickedLayer, setLastClickedLayer] = useState(null);
     const [layerDetails, setLayerDetails] = useState({});
@@ -42,7 +47,7 @@ function App() {
     useEffect(() => {
         let cancelled = false;
 
-        async function loadServiceMetadata() {
+    async function loadServiceMetadata() {
             try {
                 const response = await fetch(`${FEATURE_SERVICE}?f=json`);
                 if (!response.ok) {
@@ -77,6 +82,7 @@ function App() {
 
                 if (!cancelled) {
                     setServiceLayers(roots);
+                    setServiceTables(data.tables || []);
                     setServiceError(null);
                 }
             } catch (error) {
@@ -167,6 +173,9 @@ function App() {
             try {
                 setIndicatorError(null);
 
+                // Wait for service metadata (layers/tables) to be available before running chart queries
+                if (!serviceLayers && !serviceTables) return;
+
                 // helper to find a layer id by name in the loaded serviceLayers tree
                 function findLayerIdByName(name, nodes) {
                     if (!nodes) return null;
@@ -178,6 +187,59 @@ function App() {
                         }
                     }
                     return null;
+                }
+
+                // table lookup helpers (parallel to layer helpers)
+                function findTableIdByName(name, tables) {
+                    if (!tables) return null;
+                    for (const t of tables) {
+                        if ((t.name || '').toLowerCase() === String(name).toLowerCase()) return t.id;
+                    }
+                    return null;
+                }
+
+                function findTableIdByField(fieldNames, tables) {
+                    if (!tables) return null;
+                    const target = (Array.isArray(fieldNames) ? fieldNames : [fieldNames]).map(s => String(s).toLowerCase());
+                    for (const t of tables) {
+                        const fields = t.fields || [];
+                        for (const f of fields) {
+                            if (f && f.name && target.includes(String(f.name).toLowerCase())) {
+                                return t.id;
+                            }
+                        }
+                    }
+                    return null;
+                }
+
+                // helper: find layer id by presence of one or more field names in layer metadata
+                function findLayerIdByField(fieldNames, nodes) {
+                    if (!nodes) return null;
+                    const target = (Array.isArray(fieldNames) ? fieldNames : [fieldNames]).map(s => String(s).toLowerCase());
+                    for (const node of nodes) {
+                        const fields = node.fields || [];
+                        for (const f of fields) {
+                            if (f && f.name && target.includes(String(f.name).toLowerCase())) {
+                                return node.id;
+                            }
+                        }
+                        if (node.children && node.children.length > 0) {
+                            const found = findLayerIdByField(fieldNames, node.children);
+                            if (found != null) return found;
+                        }
+                    }
+                    return null;
+                }
+
+                // helper to robustly read an attribute value regardless of case variations
+                function attrValue(attributes, fieldName) {
+                    if (!attributes || !fieldName) return undefined;
+                    if (attributes[fieldName] !== undefined) return attributes[fieldName];
+                    const lower = String(fieldName).toLowerCase();
+                    for (const k of Object.keys(attributes)) {
+                        if (k && k.toLowerCase() === lower) return attributes[k];
+                    }
+                    return undefined;
                 }
 
                 if (!selectedProject) {
@@ -287,10 +349,12 @@ function App() {
                     return;
                 }
 
-                const projectWhere = `PROYECTO='${escapeSqlString(selectedProject)}'`;
+                const projectLayerWhere = `PROYECTO='${escapeSqlString(selectedProject)}'`;
+                const projectTableWhere = `Proyecto='${escapeSqlString(selectedProject)}'`;
+
 
                 const lotesResponse = await postQuery("4", {
-                    where: projectWhere,
+                    where: projectLayerWhere,
                     outFields: "CODIGO",
                     returnGeometry: "false",
                     resultRecordCount: "2000",
@@ -345,7 +409,7 @@ function App() {
 
                 const [areaResponse, projectsResponse] = await Promise.all([
                     postQuery("4", {
-                        where: projectWhere,
+                        where: projectLayerWhere,
                         outStatistics: JSON.stringify([
                             {
                                 statisticType: "sum",
@@ -356,7 +420,7 @@ function App() {
                         f: "json",
                     }),
                     postQuery("6", {
-                        where: projectWhere,
+                        where: projectLayerWhere,
                         returnCountOnly: "true",
                         f: "json",
                     }),
@@ -399,6 +463,152 @@ function App() {
                     ),
                     proyectosCount: Number(projectsResponse.count || 0),
                 });
+
+                // Charts for selected project: breakdown by relation (lotes / departamentos / other)
+                try {
+                    // Try to find data_comercial first among layers then tables, by name or by field presence
+                    let dataComId = findLayerIdByName('data_comercial', serviceLayers || []);
+                    let dataComType = 'layer';
+
+                    if (dataComId == null) {
+                    dataComId = findLayerIdByField(['Estado', 'Tipo_De_Venta'], serviceLayers || []);
+                        if (dataComId != null) {
+                            dataComType = 'layer';
+                        }
+                    }
+
+                    // If not found in layers, try tables
+                    if (dataComId == null) {
+                        dataComId = findTableIdByName('data_comercial', serviceTables || []);
+                        if (dataComId != null) {
+                            dataComType = 'table';
+                        }
+                    }
+
+                    if (dataComId == null) {
+                        dataComId = findTableIdByField(['Estado', 'Tipo_De_Venta'], serviceTables || []);
+                        if (dataComId != null) {
+                            dataComType = 'table';
+                        }
+                    }
+
+                    if (dataComId != null) {
+                        console.info(`[computeIndicators] using data_comercial id=${dataComId} type=${dataComType}`);
+                        const whereBase = projectTableWhere || '1=1';
+
+                        // total by ESTADO
+                        const estadoParams = {
+                            where: whereBase,
+                            groupByFieldsForStatistics: 'Estado',
+                            outStatistics: JSON.stringify([{ statisticType: 'count', onStatisticField: 'OBJECTID', outStatisticFieldName: 'cnt' }]),
+                            f: 'json',
+                        };
+                        console.info(`[computeIndicators] querying data_comercial (Estado) layer=${dataComId} params=`, estadoParams);
+                        const totalByEstado = await postQuery(String(dataComId), estadoParams);
+
+
+                        // by ESTADO and linked to lotes via CODIGO (data_comercial.CODIGO)
+                        let lotesByEstado = { features: [] };
+                        if (codigos.length > 0) {
+                            const codeList = codigos.slice(0,800).map(c => `'${String(c).replace(/'/g, "''")}'`).join(',');
+                            const whereLotes = `${projectLayerWhere} AND CODIGO IN (${codeList})`;
+                            const lotesEstadoParams = {
+                                where: whereLotes,
+                                groupByFieldsForStatistics: 'Estado',
+                                outStatistics: JSON.stringify([{ statisticType: 'count', onStatisticField: 'OBJECTID', outStatisticFieldName: 'cnt' }]),
+                                f: 'json',
+                            };
+                            console.info(`[computeIndicators] querying data_comercial for lotes by ESTADO layer=${dataComId} params=`, lotesEstadoParams);
+                            lotesByEstado = await postQuery(String(dataComId), lotesEstadoParams);
+
+                        }
+
+                        // by ESTADO and linked to departamentos via COD_PARCELA
+                        let deptByEstado = { features: [] };
+                        if (codigos.length > 0) {
+                            const codeList = codigos.slice(0,800).map(c => `'${String(c).replace(/'/g, "''")}'`).join(',');
+                            const whereDept = `${projectLayerWhere} AND CODIGO IN (${codeList})`;
+                            const deptEstadoParams = {
+                                where: whereDept,
+                                groupByFieldsForStatistics: 'Estado',
+                                outStatistics: JSON.stringify([{ statisticType: 'count', onStatisticField: 'OBJECTID', outStatisticFieldName: 'cnt' }]),
+                                f: 'json',
+                            };
+                            console.info(`[computeIndicators] querying data_comercial for departamentos by ESTADO layer=${dataComId} params=`, deptEstadoParams);
+                            deptByEstado = await postQuery(String(dataComId), deptEstadoParams);
+
+                        }
+
+                        // Build combined dataset
+                        const totals = (totalByEstado.features || []).map(f => ({ estado: attrValue(f.attributes, 'Estado') || 'Unknown', total: Number(attrValue(f.attributes, 'cnt') || 0) }));
+
+                        const lotesMap = new Map((lotesByEstado.features || []).map(f => [attrValue(f.attributes, 'Estado') || 'Unknown', Number(attrValue(f.attributes, 'cnt') || 0)]));
+                        const deptMap = new Map((deptByEstado.features || []).map(f => [attrValue(f.attributes, 'Estado') || 'Unknown', Number(attrValue(f.attributes, 'cnt') || 0)]));
+
+                        const combined = totals.map(t => {
+                            const l = lotesMap.get(t.estado) || 0;
+                            const d = deptMap.get(t.estado) || 0;
+                            const other = Math.max(0, t.total - l - d);
+                            return { estado: t.estado, lotes: l, departamentos: d, other, total: t.total };
+                        });
+
+                        setChartEstadoData(combined);
+
+                        // Tipo_De_Venta chart (grouped similarly)
+                        const tipoParams = {
+                            where: projectTableWhere,
+                            groupByFieldsForStatistics: 'Tipo_De_Venta', // normalize field name
+                            outStatistics: JSON.stringify([{ statisticType: 'count', onStatisticField: 'OBJECTID', outStatisticFieldName: 'cnt' }]),
+                            f: 'json',
+                        };
+                        console.info(`[computeIndicators] querying data_comercial (Tipo_De_Venta) layer=${dataComId} params=`, tipoParams);
+                        const totalByTipo = await postQuery(String(dataComId), tipoParams);
+
+
+                        const lotesTipoParams = (codigos.length>0) ? {
+                            where: `${whereBase} AND CODIGO IN (${codigos.slice(0,800).map(c=>`'${String(c).replace(/'/g,"''")}'`).join(',')})`,
+                            groupByFieldsForStatistics: 'Tipo_De_Venta', // normalize field name
+                            outStatistics: JSON.stringify([{ statisticType: 'count', onStatisticField: 'OBJECTID', outStatisticFieldName: 'cnt' }]),
+                            f: 'json',
+                        } : null;
+
+                        if (lotesTipoParams) {
+                            console.info(`[computeIndicators] querying data_comercial for lotes by Tipo_De_Venta layer=${dataComId} params=`, lotesTipoParams);
+                            var lotesByTipo = await postQuery(String(dataComId), lotesTipoParams);
+
+                        } else {
+                            var lotesByTipo = { features: [] };
+                        }
+
+                        const deptTipoParams = (codigos.length>0) ? {
+                            where: `${whereBase} AND CODIGO IN (${codigos.slice(0,800).map(c=>`'${String(c).replace(/'/g,"''")}'`).join(',')})`,
+                            groupByFieldsForStatistics: 'Tipo_De_Venta', // normalize field name
+                            outStatistics: JSON.stringify([{ statisticType: 'count', onStatisticField: 'OBJECTID', outStatisticFieldName: 'cnt' }]),
+                            f: 'json',
+                        } : null;
+
+                        if (deptTipoParams) {
+                            console.info(`[computeIndicators] querying data_comercial for departamentos by Tipo_De_Venta layer=${dataComId} params=`, deptTipoParams);
+                            var deptByTipo = await postQuery(String(dataComId), deptTipoParams);
+
+                        } else {
+                            var deptByTipo = { features: [] };
+                        }
+
+                        const totalTipo = (totalByTipo.features || []).map(f=>({ tipo: attrValue(f.attributes, 'Tipo_De_Venta') || 'Unknown', total: Number(attrValue(f.attributes, 'cnt') || 0) }));
+                        const lTipoMap = new Map((lotesByTipo.features || []).map(f=>[attrValue(f.attributes, 'Tipo_De_Venta') || 'Unknown', Number(attrValue(f.attributes, 'cnt') || 0)]));
+                        const dTipoMap = new Map((deptByTipo.features || []).map(f=>[attrValue(f.attributes, 'Tipo_De_Venta') || 'Unknown', Number(attrValue(f.attributes, 'cnt') || 0)]));
+
+                        const tipoCombined = totalTipo.map(t=>{
+                            const l = lTipoMap.get(t.tipo) || 0;
+                            const d = dTipoMap.get(t.tipo) || 0;
+                            const other = Math.max(0, t.total - l - d);
+                            return { tipo: t.tipo, lotes: l, departamentos: d, other, total: t.total };
+                        });
+
+                        setChartTipoData(tipoCombined);
+                    }
+                } catch (e) { console.warn('Failed to compute charts for project', e); }
             } catch (error) {
                 if (!cancelled) {
                     console.error("Failed computing indicators:", error);
@@ -412,7 +622,7 @@ function App() {
         return () => {
             cancelled = true;
         };
-    }, [selectedProject]);
+    }, [selectedProject, serviceLayers, serviceTables]);
 
     function handleToggle(id, checked) {
         setSelectedLayers((previous) => {
@@ -549,6 +759,8 @@ function App() {
             return next;
         });
     }
+
+    // StackedBarChart moved to src/components/Charts/StackedBarChart.jsx
 
     function CountUp({ value }) {
         const [display, setDisplay] = useState(0);
@@ -718,6 +930,18 @@ function App() {
             </div>
 
             <div className="ticks" />
+
+            {/* Charts section: Data Comercial visualizations */}
+            <section id="charts-section" className="charts-section">
+                <div className="charts-grid">
+                    <div style={{flex:1}}>
+                        <StackedBarChart data={chartEstadoData} categoryKey="estado" seriesKeys={["lotes","departamentos","other"]} colors={["#7cb342","#42a5f5","#888888"]} labelKey="Registros por Estado de Venta" />
+                    </div>
+                    <div style={{flex:1}}>
+                        <StackedBarChart data={chartTipoData} categoryKey="tipo" seriesKeys={["lotes","departamentos","other"]} colors={["#f6c343","#f57c42","#888888"]} labelKey="Registros por Tipo de Venta" />
+                    </div>
+                </div>
+            </section>
 
             <section id="next-steps">
                 <div id="docs">
